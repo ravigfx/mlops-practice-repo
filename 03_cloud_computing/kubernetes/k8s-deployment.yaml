@@ -1,0 +1,121 @@
+# ============================================================
+#  Kubernetes Manifests — ML Model Deployment
+#  Covers: Deployment, Service, HPA, ConfigMap, Secret
+# ============================================================
+
+# ── 1. Namespace ─────────────────────────────────────────────
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: mlops-practice
+
+---
+# ── 2. ConfigMap (non-secret config) ─────────────────────────
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: model-config
+  namespace: mlops-practice
+data:
+  MODEL_NAME: "iris_classifier"
+  MODEL_VERSION: "1.0.0"
+  LOG_LEVEL: "INFO"
+
+---
+# ── 3. Secret (sensitive values — base64 encoded) ────────────
+apiVersion: v1
+kind: Secret
+metadata:
+  name: model-secrets
+  namespace: mlops-practice
+type: Opaque
+stringData:
+  API_KEY: "your-api-key-here"   # Use sealed-secrets or Vault in prod
+
+---
+# ── 4. Deployment ────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mlmodel-deployment
+  namespace: mlops-practice
+  labels:
+    app: mlmodel
+    version: "1.0.0"
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: mlmodel
+  template:
+    metadata:
+      labels:
+        app: mlmodel
+    spec:
+      containers:
+        - name: mlmodel
+          image: your-registry/iris-classifier:1.0.0
+          ports:
+            - containerPort: 8000
+          envFrom:
+            - configMapRef:
+                name: model-config
+            - secretRef:
+                name: model-secrets
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "512Mi"
+            limits:
+              cpu: "1"
+              memory: "1Gi"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 5
+
+---
+# ── 5. Service ───────────────────────────────────────────────
+apiVersion: v1
+kind: Service
+metadata:
+  name: mlmodel-service
+  namespace: mlops-practice
+spec:
+  selector:
+    app: mlmodel
+  ports:
+    - protocol: TCP
+      port: 80
+      targetPort: 8000
+  type: ClusterIP
+
+---
+# ── 6. HorizontalPodAutoscaler ───────────────────────────────
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: mlmodel-hpa
+  namespace: mlops-practice
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: mlmodel-deployment
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70

@@ -1,0 +1,180 @@
+# ============================================================
+#  docker-compose.yml — Local MLOps Stack
+#  Services: MLflow, MinIO (S3), PostgreSQL, Airflow, Kafka,
+#            Grafana, Prometheus, Model API
+#
+#  Start all:    docker-compose up -d
+#  Start subset: docker-compose up -d mlflow minio postgres
+# ============================================================
+
+version: "3.9"
+
+volumes:
+  postgres_data:
+  minio_data:
+  grafana_data:
+  mlflow_data:
+
+networks:
+  mlops_net:
+    driver: bridge
+
+
+services:
+
+  # ── PostgreSQL (MLflow backend + Airflow metadata) ────────
+  postgres:
+    image: postgres:16-alpine
+    networks: [mlops_net]
+    environment:
+      POSTGRES_USER:     mlops
+      POSTGRES_PASSWORD: mlops_secret
+      POSTGRES_DB:       mlflow
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./infra/init-db.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mlops"]
+      interval: 5s
+      retries: 5
+    ports:
+      - "5432:5432"
+
+  # ── MinIO (S3-compatible artifact store) ─────────────────
+  minio:
+    image: minio/minio:latest
+    networks: [mlops_net]
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER:     minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin123
+    volumes:
+      - minio_data:/data
+    ports:
+      - "9000:9000"   # API
+      - "9001:9001"   # Console → http://localhost:9001
+
+  # ── MLflow Tracking Server ────────────────────────────────
+  mlflow:
+    image: python:3.11-slim
+    networks: [mlops_net]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: >
+      bash -c "pip install mlflow psycopg2-binary boto3 &&
+               mlflow server
+               --backend-store-uri postgresql://mlops:mlops_secret@postgres:5432/mlflow
+               --default-artifact-root s3://mlflow-artifacts/
+               --host 0.0.0.0 --port 5000"
+    environment:
+      AWS_ACCESS_KEY_ID:     minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin123
+      MLFLOW_S3_ENDPOINT_URL: http://minio:9000
+    ports:
+      - "5000:5000"   # MLflow UI → http://localhost:5000
+
+  # ── Model Serving API ────────────────────────────────────
+  model-api:
+    build:
+      context: .
+      dockerfile: 03_cloud_computing/docker/Dockerfile
+    networks: [mlops_net]
+    environment:
+      MODEL_PATH: /app/models/model.pkl
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+    ports:
+      - "8000:8000"   # API docs → http://localhost:8000/docs
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    depends_on:
+      - mlflow
+
+  # ── Apache Airflow (workflow orchestration) ───────────────
+  airflow-webserver:
+    image: apache/airflow:2.9.0
+    networks: [mlops_net]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://mlops:mlops_secret@postgres:5432/airflow
+      AIRFLOW__CORE__FERNET_KEY: ""
+      AIRFLOW__WEBSERVER__SECRET_KEY: mlops_secret
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+    volumes:
+      - ./05_data_engineering/airflow_pipelines:/opt/airflow/dags
+      - ./logs:/opt/airflow/logs
+    command: webserver
+    ports:
+      - "8081:8080"   # Airflow UI → http://localhost:8081
+
+  airflow-scheduler:
+    image: apache/airflow:2.9.0
+    networks: [mlops_net]
+    depends_on:
+      - airflow-webserver
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://mlops:mlops_secret@postgres:5432/airflow
+    volumes:
+      - ./05_data_engineering/airflow_pipelines:/opt/airflow/dags
+      - ./logs:/opt/airflow/logs
+    command: scheduler
+
+  # ── Prometheus (metrics scraping) ─────────────────────────
+  prometheus:
+    image: prom/prometheus:latest
+    networks: [mlops_net]
+    volumes:
+      - ./infra/prometheus.yml:/etc/prometheus/prometheus.yml
+    ports:
+      - "9090:9090"
+
+  # ── Grafana (dashboards) ──────────────────────────────────
+  grafana:
+    image: grafana/grafana:latest
+    networks: [mlops_net]
+    depends_on: [prometheus]
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./infra/grafana/dashboards:/etc/grafana/provisioning/dashboards
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    ports:
+      - "3000:3000"   # Grafana → http://localhost:3000 (admin/admin)
+
+  # ── Kafka + Zookeeper ─────────────────────────────────────
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.6.0
+    networks: [mlops_net]
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+
+  kafka:
+    image: confluentinc/cp-kafka:7.6.0
+    networks: [mlops_net]
+    depends_on: [zookeeper]
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+    ports:
+      - "29092:29092"
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    networks: [mlops_net]
+    depends_on: [kafka]
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+    ports:
+      - "8082:8080"   # Kafka UI → http://localhost:8082
