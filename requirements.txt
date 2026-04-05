@@ -21,7 +21,7 @@ pyspark==3.5.1
 # Model Serving
 fastapi==0.110.1
 uvicorn==0.29.0
-flask==3.0.2
+flask==2.2.5
 
 # Monitoring
 evidently==0.4.16
